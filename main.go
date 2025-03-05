@@ -264,6 +264,17 @@ func deleteUserHistory(telegramID int64) error {
 	return nil
 }
 
+func cleanupMessageHistory(telegramID int64, messages []Message) error {
+	if len(messages) > 100 {
+		log.Printf("Message history for user %d exceeds 100 messages, cleaning up...", telegramID)
+		if err := deleteUserHistory(telegramID); err != nil {
+			return fmt.Errorf("error cleaning up message history: %v", err)
+		}
+		log.Printf("Successfully cleaned up message history for user %d", telegramID)
+	}
+	return nil
+}
+
 func main() {
 	loadEnvFile(".env")
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
@@ -292,6 +303,10 @@ func main() {
 		prevMessages, err := getUserMessages(c.Sender().ID)
 		if err != nil {
 			log.Printf("Error getting previous messages: %v\n", err)
+		}
+
+		if err := cleanupMessageHistory(c.Sender().ID, prevMessages); err != nil {
+			log.Printf("Error during message cleanup: %v\n", err)
 		}
 
 		var contextMessages []Content
