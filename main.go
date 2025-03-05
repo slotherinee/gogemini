@@ -58,6 +58,7 @@ type Message struct {
 type UserMessages struct {
 	ID         int64     `json:"id"`
 	TelegramID int64     `json:"telegramId"`
+	Username   string    `json:"username"`
 	Messages   []Message `json:"messages"`
 }
 
@@ -133,11 +134,19 @@ func getUserMessages(telegramID int64) ([]Message, error) {
 	return []Message{}, nil
 }
 
-func saveMessage(telegramID int64, userMsg, aiMsg string) error {
+func saveMessage(telegramID int64, userMsg, aiMsg string, sender *tele.User) error {
 	mokkyURL := os.Getenv("MOKKY_URL")
 	if mokkyURL == "" {
 		return fmt.Errorf("MOKKY_URL environment variable is not set")
 	}
+
+	username := "no username " + fmt.Sprint(sender.ID)
+	if sender.Username != "" {
+		username = sender.Username
+	} else if sender.FirstName != "" {
+		username = sender.FirstName
+	}
+
 	resp, err := http.Get(fmt.Sprintf("%susers?telegramId=%d", mokkyURL, telegramID))
 	if err != nil {
 		return fmt.Errorf("error checking user existence: %v", err)
@@ -160,7 +169,6 @@ func saveMessage(telegramID int64, userMsg, aiMsg string) error {
 		method = "PATCH"
 		url = fmt.Sprintf("https://4140c0059f1c791f.mokky.dev/users/%d", users[0].ID)
 	} else {
-
 		messages = []Message{
 			{Role: "user", Message: userMsg},
 			{Role: "model", Message: aiMsg},
@@ -171,6 +179,7 @@ func saveMessage(telegramID int64, userMsg, aiMsg string) error {
 
 	userMsgs := UserMessages{
 		TelegramID: telegramID,
+		Username:   username,
 		Messages:   messages,
 	}
 
@@ -360,7 +369,7 @@ func main() {
 			}
 
 			telegramID := c.Sender().ID
-			if err := saveMessage(telegramID, userMsg, fullResponse.String()); err != nil {
+			if err := saveMessage(telegramID, userMsg, fullResponse.String(), c.Sender()); err != nil {
 				log.Printf("Error saving messages: %v\n", err)
 			}
 
