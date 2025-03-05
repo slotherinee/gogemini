@@ -208,6 +208,62 @@ func saveMessage(telegramID int64, userMsg, aiMsg string, sender *tele.User) err
 	return nil
 }
 
+func deleteUserHistory(telegramID int64) error {
+	mokkyURL := os.Getenv("MOKKY_URL")
+	if mokkyURL == "" {
+		return fmt.Errorf("MOKKY_URL environment variable is not set")
+	}
+
+	// First get the user's record to get their ID
+	resp, err := http.Get(fmt.Sprintf("%susers?telegramId=%d", mokkyURL, telegramID))
+	if err != nil {
+		return fmt.Errorf("error checking user existence: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var users []UserMessages
+	if err := json.NewDecoder(resp.Body).Decode(&users); err != nil {
+		return fmt.Errorf("error decoding API response: %v", err)
+	}
+
+	if len(users) == 0 {
+		return fmt.Errorf("no history found for this user")
+	}
+
+	// Update the user's record with empty messages array
+	url := fmt.Sprintf("%susers/%d", mokkyURL, users[0].ID)
+	userMsgs := UserMessages{
+		ID:         users[0].ID,
+		TelegramID: telegramID,
+		Username:   users[0].Username,
+		Messages:   []Message{},
+	}
+
+	jsonData, err := json.Marshal(userMsgs)
+	if err != nil {
+		return fmt.Errorf("error marshaling messages: %v", err)
+	}
+
+	req, err := http.NewRequest("PATCH", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("error creating request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err = client.Do(req)
+	if err != nil {
+		return fmt.Errorf("error sending request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API returned non-200 status code: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
 func main() {
 	loadEnvFile(".env")
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
@@ -398,6 +454,15 @@ func main() {
 		}
 
 		return nil
+	})
+
+	b.Handle("/history", func(c tele.Context) error {
+		err := deleteUserHistory(c.Sender().ID)
+		if err != nil {
+			log.Printf("Error deleting user history: %v\n", err)
+			return c.Send("Error deleting user history")
+		}
+		return c.Send("Your messsage history has been cleared!")
 	})
 
 	log.Println("Bot is running...")
