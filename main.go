@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,7 +15,10 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:streamGenerateContent"
+const (
+	GEMINI_API_URL    = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:streamGenerateContent"
+	GEMINI_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+)
 
 type GeminiRequest struct {
 	SystemInstruction Content   `json:"system_instruction"`
@@ -27,8 +31,14 @@ type Safety struct {
 	Threshold string `json:"threshold"`
 }
 
+type FileData struct {
+	MimeType string `json:"mime_type"`
+	FileURI  string `json:"file_uri"`
+}
+
 type Part struct {
-	Text string `json:"text"`
+	Text     string    `json:"text,omitempty"`
+	FileData *FileData `json:"file_data,omitempty"`
 }
 
 type Content struct {
@@ -108,6 +118,60 @@ func loadEnvFile(filename string) {
 	if err := scanner.Err(); err != nil {
 		fmt.Println("Error reading file:", err)
 	}
+}
+
+func uploadAudioToGemini(audioData []byte, mimeType string, apiKey string) (string, error) {
+	// Initial resumable upload request
+	startReq, err := http.NewRequest("POST", fmt.Sprintf("%s?key=%s", GEMINI_UPLOAD_URL, apiKey), strings.NewReader(`{"file":{"display_name":"AUDIO"}}`))
+	if err != nil {
+		return "", fmt.Errorf("error creating upload request: %v", err)
+	}
+
+	startReq.Header.Set("X-Goog-Upload-Protocol", "resumable")
+	startReq.Header.Set("X-Goog-Upload-Command", "start")
+	startReq.Header.Set("X-Goog-Upload-Header-Content-Length", fmt.Sprintf("%d", len(audioData)))
+	startReq.Header.Set("X-Goog-Upload-Header-Content-Type", mimeType)
+	startReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(startReq)
+	if err != nil {
+		return "", fmt.Errorf("error starting upload: %v", err)
+	}
+	defer resp.Body.Close()
+
+	uploadURL := resp.Header.Get("X-Goog-Upload-URL")
+	if uploadURL == "" {
+		return "", fmt.Errorf("no upload URL received")
+	}
+
+	// Upload the actual audio data
+	uploadReq, err := http.NewRequest("POST", uploadURL, bytes.NewReader(audioData))
+	if err != nil {
+		return "", fmt.Errorf("error creating data upload request: %v", err)
+	}
+
+	uploadReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(audioData)))
+	uploadReq.Header.Set("X-Goog-Upload-Offset", "0")
+	uploadReq.Header.Set("X-Goog-Upload-Command", "upload, finalize")
+
+	resp, err = client.Do(uploadReq)
+	if err != nil {
+		return "", fmt.Errorf("error uploading data: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var fileInfo struct {
+		File struct {
+			URI string `json:"uri"`
+		} `json:"file"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&fileInfo); err != nil {
+		return "", fmt.Errorf("error decoding file info: %v", err)
+	}
+
+	return fileInfo.File.URI, nil
 }
 
 func getUserMessages(telegramID int64) ([]Message, error) {
@@ -469,6 +533,242 @@ func main() {
 		}
 
 		return nil
+	})
+
+	b.Handle(tele.OnVoice, func(c tele.Context) error {
+		voice := c.Message().Voice
+
+		file, err := b.File(&voice.File)
+		if err != nil {
+			log.Printf("Error getting voice file: %v\n", err)
+			return c.Send("Error processing voice message")
+		}
+
+		data, err := io.ReadAll(file)
+		if err != nil {
+			log.Printf("Error downloading voice file: %v\n", err)
+			return c.Send("Error downloading voice message")
+		}
+
+		fileURI, err := uploadAudioToGemini(data, "audio/ogg", geminiApiKey)
+		if err != nil {
+			log.Printf("Error uploading audio to Gemini: %v\n", err)
+			return c.Send("Error processing voice message")
+		}
+
+		var client = &http.Client{} // Add this at the start of the handler
+		var url string              // Add this at the start of the handler
+
+		// First request to transcribe
+		transcriptionReq := GeminiRequest{
+			SystemInstruction: Content{
+				Parts: []Part{
+					{Text: "You are a transcription assistant. Only output the transcribed text without any additional commentary."},
+				},
+			},
+			Contents: []Content{
+				{
+					Role: "user",
+					Parts: []Part{
+						{
+							FileData: &FileData{
+								MimeType: "audio/ogg",
+								FileURI:  fileURI,
+							},
+						},
+					},
+				},
+			},
+			SafetySettings: []Safety{
+				{
+					Category:  "HARM_CATEGORY_HARASSMENT",
+					Threshold: "BLOCK_NONE",
+				},
+				{
+					Category:  "HARM_CATEGORY_HATE_SPEECH",
+					Threshold: "BLOCK_NONE",
+				},
+				{
+					Category:  "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+					Threshold: "BLOCK_NONE",
+				},
+				{
+					Category:  "HARM_CATEGORY_DANGEROUS_CONTENT",
+					Threshold: "BLOCK_NONE",
+				},
+			},
+		}
+
+		// Get transcription first
+		transcription := ""
+		jsonData, err := json.Marshal(transcriptionReq)
+		if err != nil {
+			log.Println("Error marshaling transcription request:", err)
+			return c.Send("Error processing your request")
+		}
+
+		// Make transcription request
+		url = fmt.Sprintf("%s?key=%s", GEMINI_API_URL, geminiApiKey)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Println("Error creating transcription request:", err)
+			return c.Send("Error creating request")
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		resp, err = client.Do(req)
+		if err != nil {
+			log.Println("Error making transcription request:", err)
+			return c.Send("Error transcribing audio")
+		}
+		defer resp.Body.Close()
+
+		var transcriptionResp GeminiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&transcriptionResp); err != nil {
+			log.Printf("Error decoding transcription response: %v\n", err)
+			return c.Send("Error processing transcription")
+		}
+
+		if len(transcriptionResp.Candidates) > 0 && len(transcriptionResp.Candidates[0].Content.Parts) > 0 {
+			transcription = transcriptionResp.Candidates[0].Content.Parts[0].Text
+		}
+
+		reqBody := GeminiRequest{
+			SystemInstruction: Content{
+				Parts: []Part{
+					{Text: "You are a helpful assistant. When responding, act as if you are continuing a conversation. Use only these punctuation marks: , . ? ! - \n" +
+						"Do not use any other special characters or formatting. Keep your responses under 4096 characters. Respond with the actual content only, no need to add role prefixes."},
+				},
+			},
+			Contents: []Content{
+				{
+					Role: "user",
+					Parts: []Part{
+						{Text: transcription}, // Use the transcription as the input text
+					},
+				},
+			},
+			SafetySettings: []Safety{
+				{
+					Category:  "HARM_CATEGORY_HARASSMENT",
+					Threshold: "BLOCK_NONE",
+				},
+				{
+					Category:  "HARM_CATEGORY_HATE_SPEECH",
+					Threshold: "BLOCK_NONE",
+				},
+				{
+					Category:  "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+					Threshold: "BLOCK_NONE",
+				},
+				{
+					Category:  "HARM_CATEGORY_DANGEROUS_CONTENT",
+					Threshold: "BLOCK_NONE",
+				},
+			},
+		}
+		jsonData, err := json.Marshal(reqBody)
+		if err != nil {
+			log.Println("Error marshaling request body:", err)
+			return c.Send("Error processing your request")
+		}
+
+		url := fmt.Sprintf("%s?key=%s&alt=sse", GEMINI_API_URL, geminiApiKey)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Println("Error creating request:", err)
+			return c.Send("Error creating request")
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Println("Error making request to Gemini API:", err)
+			return c.Send("Error connecting to AI service")
+		}
+		defer resp.Body.Close()
+
+		scanner := bufio.NewScanner(resp.Body)
+		var fullResponse strings.Builder
+		var msg *tele.Message
+
+		var lastUpdate time.Time
+		updateInterval := 500 * time.Millisecond
+		var firstChunk bool = true
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("Raw line: %s\n", line)
+
+			if line == "" {
+				continue
+			}
+
+			geminiResp, err := parseSSEResponse(line)
+			if err != nil {
+				log.Printf("Error parsing SSE response: %v\n", err)
+				continue
+			}
+
+			if geminiResp != nil && len(geminiResp.Candidates) > 0 {
+				candidate := geminiResp.Candidates[0]
+				if len(candidate.Content.Parts) > 0 {
+					chunk := candidate.Content.Parts[0].Text
+					log.Printf("Received chunk: %s\n", chunk)
+					fullResponse.WriteString(chunk)
+
+					if firstChunk {
+						msg, err = b.Send(c.Recipient(), chunk, &tele.SendOptions{
+							ParseMode: tele.ModeMarkdown,
+						})
+						if err != nil {
+							log.Printf("Error sending first chunk: %v\n", err)
+							return err
+						}
+						firstChunk = false
+						lastUpdate = time.Now()
+						continue
+					}
+
+					if time.Since(lastUpdate) > updateInterval {
+						_, err := b.Edit(msg, fullResponse.String(), &tele.SendOptions{
+							ParseMode: tele.ModeMarkdown,
+						})
+						if err != nil {
+							log.Printf("Error updating message: %v\n", err)
+						}
+						lastUpdate = time.Now()
+					}
+				}
+			}
+		}
+
+		if fullResponse.Len() > 0 {
+			finalText := fullResponse.String() + "\u200B"
+			_, err := b.Edit(msg, finalText, &tele.SendOptions{
+				ParseMode: tele.ModeMarkdown,
+			})
+			if err != nil {
+				log.Printf("Error sending final update: %v\n", err)
+			}
+
+			// Save the transcription and response to user history
+			if err := saveMessage(c.Sender().ID, transcription, fullResponse.String(), c.Sender()); err != nil {
+				log.Printf("Error saving messages: %v\n", err)
+			}
+
+			return nil
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Unexpected status code: %d\n", resp.StatusCode)
+			return c.Send("Error: API returned non-200 status code")
+		}
+
+		return c.Send("Sorry, I couldn't process your voice message")
 	})
 
 	b.Handle("/history", func(c tele.Context) error {
