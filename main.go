@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -28,7 +29,13 @@ type Safety struct {
 }
 
 type Part struct {
-	Text string `json:"text"`
+	Text       string    `json:"text,omitempty"`
+	InlineData *FileData `json:"inline_data,omitempty"`
+}
+
+type FileData struct {
+	MimeType string `json:"mime_type"`
+	Data     string `json:"data"`
 }
 
 type Content struct {
@@ -51,8 +58,9 @@ type SSEResponse struct {
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Message string `json:"message"`
+	Role    string    `json:"role"`
+	Message string    `json:"message"`
+	Image   *FileData `json:"image,omitempty"`
 }
 
 type UserMessages struct {
@@ -134,7 +142,7 @@ func getUserMessages(telegramID int64) ([]Message, error) {
 	return []Message{}, nil
 }
 
-func saveMessage(telegramID int64, userMsg, aiMsg string, sender *tele.User) error {
+func saveMessage(telegramID int64, userMsg, aiMsg string, sender *tele.User, imageData *FileData) error {
 	mokkyURL := os.Getenv("MOKKY_URL")
 	if mokkyURL == "" {
 		return fmt.Errorf("MOKKY_URL environment variable is not set")
@@ -163,8 +171,15 @@ func saveMessage(telegramID int64, userMsg, aiMsg string, sender *tele.User) err
 
 	if len(users) > 0 {
 		messages = append(users[0].Messages, []Message{
-			{Role: "user", Message: userMsg},
-			{Role: "model", Message: aiMsg},
+			{
+				Role:    "user",
+				Message: userMsg,
+				Image:   imageData, // Add image data if present
+			},
+			{
+				Role:    "model",
+				Message: aiMsg,
+			},
 		}...)
 		method = "PATCH"
 		url = fmt.Sprintf("https://4140c0059f1c791f.mokky.dev/users/%d", users[0].ID)
@@ -440,7 +455,7 @@ func main() {
 			}
 
 			telegramID := c.Sender().ID
-			if err := saveMessage(telegramID, userMsg, fullResponse.String(), c.Sender()); err != nil {
+			if err := saveMessage(telegramID, userMsg, fullResponse.String(), c.Sender(), nil); err != nil {
 				log.Printf("Error saving messages: %v\n", err)
 			}
 
@@ -467,6 +482,190 @@ func main() {
 		if msg == nil {
 			return c.Send("Sorry, I couldn't generate a response")
 		}
+
+		return nil
+	})
+
+	b.Handle(tele.OnPhoto, func(c tele.Context) error {
+		photo := c.Message().Photo
+		if photo == nil {
+			return c.Send("No photo found in message")
+		}
+
+		// Download the photo
+		file, err := b.File(&photo.File)
+		if err != nil {
+			log.Printf("Error getting photo file: %v\n", err)
+			return c.Send("Error processing image")
+		}
+
+		// Read the file data
+		data := make([]byte, photo.File.FileSize)
+		_, err = file.Read(data)
+		if err != nil {
+			log.Printf("Error reading photo data: %v\n", err)
+			return c.Send("Error reading image")
+		}
+
+		// Convert to base64
+		base64Data := base64.StdEncoding.EncodeToString(data)
+		imageData := &FileData{
+			MimeType: "image/jpeg",
+			Data:     base64Data,
+		}
+
+		userMsg := c.Message().Caption
+		if userMsg == "" {
+			userMsg = "Image sent without caption"
+		}
+
+		// Create request body
+		// In the photo handler, update the reqBody creation:
+		// In the photo handler, update the reqBody creation:
+		reqBody := GeminiRequest{
+			SystemInstruction: Content{
+				Parts: []Part{
+					{Text: "You are a helpful assistant. When analyzing images, provide detailed descriptions and answer any questions about them. Use only these punctuation marks: , . ? ! - \n"},
+				},
+			},
+			Contents: []Content{
+				{
+					Role: "user",
+					Parts: []Part{
+						{Text: userMsg},
+						{InlineData: imageData},
+					},
+				},
+			},
+			SafetySettings: []Safety{
+				{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_HATE_SPEECH", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Threshold: "BLOCK_NONE"},
+			},
+		}
+
+		jsonData, err := json.Marshal(reqBody)
+		if err != nil {
+			log.Println("Error marshaling request body:", err)
+			return c.Send("Error processing your request")
+		}
+
+		url := fmt.Sprintf("%s?key=%s&alt=sse", GEMINI_API_URL, geminiApiKey)
+
+		client := &http.Client{}
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Println("Error creating request:", err)
+			return c.Send("Error creating request")
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Println("Error making request to Gemini API:", err)
+			return c.Send("Error connecting to AI service")
+		}
+		defer resp.Body.Close()
+
+		scanner := bufio.NewScanner(resp.Body)
+		var fullResponse strings.Builder
+		var msg *tele.Message
+
+		var lastUpdate time.Time
+		updateInterval := 500 * time.Millisecond
+		var firstChunk bool = true
+
+		for scanner.Scan() {
+			line := scanner.Text()
+
+			log.Printf("Raw line: %s\n", line)
+
+			if line == "" {
+				continue
+			}
+
+			geminiResp, err := parseSSEResponse(line)
+			if err != nil {
+				log.Printf("Error parsing SSE response: %v\n", err)
+				continue
+			}
+
+			if geminiResp != nil && len(geminiResp.Candidates) > 0 {
+				candidate := geminiResp.Candidates[0]
+				if len(candidate.Content.Parts) > 0 {
+					chunk := candidate.Content.Parts[0].Text
+					log.Printf("Received chunk: %s\n", chunk)
+					fullResponse.WriteString(chunk)
+
+					if firstChunk {
+						msg, err = b.Send(c.Recipient(), chunk, &tele.SendOptions{
+							ParseMode: tele.ModeMarkdown,
+						})
+						if err != nil {
+							log.Printf("Error sending first chunk: %v\n", err)
+							return err
+						}
+						firstChunk = false
+						lastUpdate = time.Now()
+						continue
+					}
+
+					if time.Since(lastUpdate) > updateInterval {
+						_, err := b.Edit(msg, fullResponse.String(), &tele.SendOptions{
+							ParseMode: tele.ModeMarkdown,
+						})
+						if err != nil {
+							log.Printf("Error updating message: %v\n", err)
+						}
+						lastUpdate = time.Now()
+					}
+				}
+			}
+		}
+
+		if fullResponse.Len() > 0 {
+			finalText := fullResponse.String() + "\u200B"
+			_, err := b.Edit(msg, finalText, &tele.SendOptions{
+				ParseMode: tele.ModeMarkdown,
+			})
+			if err != nil {
+				log.Printf("Error sending final update: %v\n", err)
+			}
+
+			telegramID := c.Sender().ID
+			if err := saveMessage(telegramID, userMsg, fullResponse.String(), c.Sender(), imageData); err != nil {
+				log.Printf("Error saving messages: %v\n", err)
+			}
+
+			return nil
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Unexpected status code: %d\n", resp.StatusCode)
+			if msg != nil {
+				_, err := b.Edit(msg, "Error: API returned non-200 status code", &tele.SendOptions{
+					ParseMode: tele.ModeMarkdown,
+				})
+				if err != nil {
+					log.Printf("Error sending error message: %v\n", err)
+				}
+			} else {
+				err := c.Send("Error: API returned non-200 status code")
+				if err != nil {
+					log.Printf("Error sending error message: %v\n", err)
+				}
+			}
+			return nil
+		}
+		if msg == nil {
+			return c.Send("Sorry, I couldn't generate a response")
+		}
+
+		// ... Rest of your existing streaming response handling code ...
+		// Copy the streaming response handling from your OnText handler
 
 		return nil
 	})
