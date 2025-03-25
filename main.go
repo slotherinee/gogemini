@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -369,8 +370,8 @@ func main() {
 			log.Println("Error marshaling request body:", err)
 			return c.Send("Error processing your request")
 		}
-		log.Printf("Sending request: %s\n", jsonData)
-		url := fmt.Sprintf("%s?key=%s&alt=sse", GEMINI_API_URL, geminiApiKey)
+
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=%s", geminiApiKey)
 
 		client := &http.Client{}
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
@@ -380,7 +381,6 @@ func main() {
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "text/event-stream")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -389,101 +389,28 @@ func main() {
 		}
 		defer resp.Body.Close()
 
-		scanner := bufio.NewScanner(resp.Body)
-		var fullResponse strings.Builder
-		var msg *tele.Message
-
-		var lastUpdate time.Time
-		updateInterval := 500 * time.Millisecond
-		var firstChunk bool = true
-
-		for scanner.Scan() {
-			line := scanner.Text()
-
-			log.Printf("Raw line: %s\n", line)
-
-			if line == "" {
-				continue
-			}
-
-			geminiResp, err := parseSSEResponse(line)
-			if err != nil {
-				log.Printf("Error parsing SSE response: %v\n", err)
-				continue
-			}
-
-			if geminiResp != nil && len(geminiResp.Candidates) > 0 {
-				candidate := geminiResp.Candidates[0]
-				if len(candidate.Content.Parts) > 0 {
-					chunk := candidate.Content.Parts[0].Text
-					log.Printf("Received chunk: %s\n", chunk)
-					fullResponse.WriteString(chunk)
-
-					if firstChunk {
-						msg, err = b.Send(c.Recipient(), chunk, &tele.SendOptions{
-							ParseMode: tele.ModeMarkdown,
-						})
-						if err != nil {
-							log.Printf("Error sending first chunk: %v\n", err)
-							return err
-						}
-						firstChunk = false
-						lastUpdate = time.Now()
-						continue
-					}
-
-					if time.Since(lastUpdate) > updateInterval {
-						_, err := b.Edit(msg, fullResponse.String(), &tele.SendOptions{
-							ParseMode: tele.ModeMarkdown,
-						})
-						if err != nil {
-							log.Printf("Error updating message: %v\n", err)
-						}
-						lastUpdate = time.Now()
-					}
-				}
-			}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("Error Response Body: %s\n", body)
+			return c.Send("Error: API returned non-200 status code")
 		}
 
-		if fullResponse.Len() > 0 {
-			finalText := fullResponse.String() + "\u200B"
-			_, err := b.Edit(msg, finalText, &tele.SendOptions{
-				ParseMode: tele.ModeMarkdown,
-			})
-			if err != nil {
-				log.Printf("Error sending final update: %v\n", err)
-			}
+		var geminiResp GeminiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+			log.Println("Error decoding response:", err)
+			return c.Send("Error decoding AI response")
+		}
 
+		if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
+			responseText := geminiResp.Candidates[0].Content.Parts[0].Text
 			telegramID := c.Sender().ID
-			if err := saveMessage(telegramID, userMsg, fullResponse.String(), c.Sender(), nil); err != nil {
+			if err := saveMessage(telegramID, userMsg, responseText, c.Sender(), nil); err != nil {
 				log.Printf("Error saving messages: %v\n", err)
 			}
-
-			return nil
+			return c.Send(responseText)
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Unexpected status code: %d\n", resp.StatusCode)
-			if msg != nil {
-				_, err := b.Edit(msg, "Error: API returned non-200 status code", &tele.SendOptions{
-					ParseMode: tele.ModeMarkdown,
-				})
-				if err != nil {
-					log.Printf("Error sending error message: %v\n", err)
-				}
-			} else {
-				err := c.Send("Error: API returned non-200 status code")
-				if err != nil {
-					log.Printf("Error sending error message: %v\n", err)
-				}
-			}
-			return nil
-		}
-		if msg == nil {
-			return c.Send("Sorry, I couldn't generate a response")
-		}
-
-		return nil
+		return c.Send("Sorry, I couldn't generate a response")
 	})
 
 	b.Handle(tele.OnPhoto, func(c tele.Context) error {
@@ -491,6 +418,8 @@ func main() {
 		if photo == nil {
 			return c.Send("No photo found in message")
 		}
+
+		c.Notify(tele.Typing)
 
 		// Download the photo
 		file, err := b.File(&photo.File)
@@ -519,9 +448,6 @@ func main() {
 			userMsg = "Image sent without caption"
 		}
 
-		// Create request body
-		// In the photo handler, update the reqBody creation:
-		// In the photo handler, update the reqBody creation:
 		reqBody := GeminiRequest{
 			SystemInstruction: Content{
 				Parts: []Part{
@@ -551,7 +477,7 @@ func main() {
 			return c.Send("Error processing your request")
 		}
 
-		url := fmt.Sprintf("%s?key=%s&alt=sse", GEMINI_API_URL, geminiApiKey)
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=%s", geminiApiKey)
 
 		client := &http.Client{}
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
@@ -561,7 +487,6 @@ func main() {
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "text/event-stream")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -570,107 +495,32 @@ func main() {
 		}
 		defer resp.Body.Close()
 
-		scanner := bufio.NewScanner(resp.Body)
-		var fullResponse strings.Builder
-		var msg *tele.Message
-
-		var lastUpdate time.Time
-		updateInterval := 500 * time.Millisecond
-		var firstChunk bool = true
-
-		for scanner.Scan() {
-			line := scanner.Text()
-
-			log.Printf("Raw line: %s\n", line)
-
-			if line == "" {
-				continue
-			}
-
-			geminiResp, err := parseSSEResponse(line)
-			if err != nil {
-				log.Printf("Error parsing SSE response: %v\n", err)
-				continue
-			}
-
-			if geminiResp != nil && len(geminiResp.Candidates) > 0 {
-				candidate := geminiResp.Candidates[0]
-				if len(candidate.Content.Parts) > 0 {
-					chunk := candidate.Content.Parts[0].Text
-					log.Printf("Received chunk: %s\n", chunk)
-					fullResponse.WriteString(chunk)
-
-					if firstChunk {
-						msg, err = b.Send(c.Recipient(), chunk, &tele.SendOptions{
-							ParseMode: tele.ModeMarkdown,
-						})
-						if err != nil {
-							log.Printf("Error sending first chunk: %v\n", err)
-							return err
-						}
-						firstChunk = false
-						lastUpdate = time.Now()
-						continue
-					}
-
-					if time.Since(lastUpdate) > updateInterval {
-						_, err := b.Edit(msg, fullResponse.String(), &tele.SendOptions{
-							ParseMode: tele.ModeMarkdown,
-						})
-						if err != nil {
-							log.Printf("Error updating message: %v\n", err)
-						}
-						lastUpdate = time.Now()
-					}
-				}
-			}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("Error Response Body: %s\n", body)
+			return c.Send("Error: API returned non-200 status code")
 		}
 
-		if fullResponse.Len() > 0 {
-			finalText := fullResponse.String() + "\u200B"
-			_, err := b.Edit(msg, finalText, &tele.SendOptions{
-				ParseMode: tele.ModeMarkdown,
-			})
-			if err != nil {
-				log.Printf("Error sending final update: %v\n", err)
-			}
+		var geminiResp GeminiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+			log.Println("Error decoding response:", err)
+			return c.Send("Error decoding AI response")
+		}
 
+		if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
+			responseText := geminiResp.Candidates[0].Content.Parts[0].Text
 			telegramID := c.Sender().ID
-			if err := saveMessage(telegramID, userMsg, fullResponse.String(), c.Sender(), imageData); err != nil {
+			if err := saveMessage(telegramID, userMsg, responseText, c.Sender(), imageData); err != nil {
 				log.Printf("Error saving messages: %v\n", err)
 			}
-
-			return nil
+			return c.Send(responseText)
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Unexpected status code: %d\n", resp.StatusCode)
-			if msg != nil {
-				_, err := b.Edit(msg, "Error: API returned non-200 status code", &tele.SendOptions{
-					ParseMode: tele.ModeMarkdown,
-				})
-				if err != nil {
-					log.Printf("Error sending error message: %v\n", err)
-				}
-			} else {
-				err := c.Send("Error: API returned non-200 status code")
-				if err != nil {
-					log.Printf("Error sending error message: %v\n", err)
-				}
-			}
-			return nil
-		}
-		if msg == nil {
-			return c.Send("Sorry, I couldn't generate a response")
-		}
-
-		// ... Rest of your existing streaming response handling code ...
-		// Copy the streaming response handling from your OnText handler
-
-		return nil
+		return c.Send("Sorry, I couldn't generate a response")
 	})
 
 	b.Handle("/history", func(c tele.Context) error {
+		c.Notify(tele.Typing)
 		err := deleteUserHistory(c.Sender().ID)
 		if err != nil {
 			log.Printf("Error deleting user history: %v\n", err)
