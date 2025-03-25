@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -44,6 +45,16 @@ type Content struct {
 	Parts []Part `json:"parts"`
 }
 
+type GenerationConfig struct {
+	ResponseModalities []string `json:"responseModalities"`
+}
+
+type ImageGenerationRequest struct {
+	Contents         []Content        `json:"contents"`
+	GenerationConfig GenerationConfig `json:"generationConfig"`
+	SafetySettings   []Safety         `json:"safety_settings,omitempty"`
+}
+
 type GeminiResponse struct {
 	Candidates []struct {
 		Content struct {
@@ -69,26 +80,6 @@ type UserMessages struct {
 	TelegramID int64     `json:"telegramId"`
 	Username   string    `json:"username"`
 	Messages   []Message `json:"messages"`
-}
-
-func parseSSEResponse(line string) (*GeminiResponse, error) {
-	if !strings.HasPrefix(line, "data: ") {
-		return nil, nil
-	}
-
-	data := strings.TrimPrefix(line, "data: ")
-	if data == "[DONE]" {
-		return nil, nil
-	}
-
-	data = strings.TrimLeft(data, " \t\r\n\x00\x1b")
-
-	var resp GeminiResponse
-	if err := json.Unmarshal([]byte(data), &resp); err != nil {
-		log.Printf("Raw data causing error: %q\n", data)
-		return nil, fmt.Errorf("unmarshal error: %v", err)
-	}
-	return &resp, nil
 }
 
 func loadEnvFile(filename string) {
@@ -143,7 +134,7 @@ func getUserMessages(telegramID int64) ([]Message, error) {
 	return []Message{}, nil
 }
 
-func saveMessage(telegramID int64, userMsg, aiMsg string, sender *tele.User, imageData *FileData) error {
+func saveMessage(telegramID int64, userMsg, aiMsg string, sender *tele.User, imageData *FileData, imageInUserMsg bool) error {
 	mokkyURL := os.Getenv("MOKKY_URL")
 	if mokkyURL == "" {
 		return fmt.Errorf("MOKKY_URL environment variable is not set")
@@ -170,27 +161,37 @@ func saveMessage(telegramID int64, userMsg, aiMsg string, sender *tele.User, ima
 	var messages []Message
 	var method, url string
 
+	var userImage, modelImage *FileData
+	if imageInUserMsg {
+		userImage = imageData
+		modelImage = nil
+	} else {
+		userImage = nil
+		modelImage = imageData
+	}
+
 	if len(users) > 0 {
 		messages = append(users[0].Messages, []Message{
 			{
 				Role:    "user",
 				Message: userMsg,
-				Image:   imageData, // Add image data if present
+				Image:   userImage,
 			},
 			{
 				Role:    "model",
 				Message: aiMsg,
+				Image:   modelImage,
 			},
 		}...)
 		method = "PATCH"
-		url = fmt.Sprintf("https://4140c0059f1c791f.mokky.dev/users/%d", users[0].ID)
+		url = fmt.Sprintf("%susers/%d", mokkyURL, users[0].ID)
 	} else {
 		messages = []Message{
-			{Role: "user", Message: userMsg},
-			{Role: "model", Message: aiMsg},
+			{Role: "user", Message: userMsg, Image: userImage},
+			{Role: "model", Message: aiMsg, Image: modelImage},
 		}
 		method = "POST"
-		url = "https://4140c0059f1c791f.mokky.dev/users"
+		url = mokkyURL + "users"
 	}
 
 	userMsgs := UserMessages{
@@ -404,7 +405,7 @@ func main() {
 		if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
 			responseText := geminiResp.Candidates[0].Content.Parts[0].Text
 			telegramID := c.Sender().ID
-			if err := saveMessage(telegramID, userMsg, responseText, c.Sender(), nil); err != nil {
+			if err := saveMessage(telegramID, userMsg, responseText, c.Sender(), nil, false); err != nil {
 				log.Printf("Error saving messages: %v\n", err)
 			}
 			return c.Send(responseText)
@@ -510,7 +511,7 @@ func main() {
 		if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
 			responseText := geminiResp.Candidates[0].Content.Parts[0].Text
 			telegramID := c.Sender().ID
-			if err := saveMessage(telegramID, userMsg, responseText, c.Sender(), imageData); err != nil {
+			if err := saveMessage(telegramID, userMsg, responseText, c.Sender(), imageData, true); err != nil {
 				log.Printf("Error saving messages: %v\n", err)
 			}
 			return c.Send(responseText)
@@ -527,6 +528,162 @@ func main() {
 			return c.Send("Error deleting user history")
 		}
 		return c.Send("Your messsage history has been cleared!")
+	})
+
+	b.Handle("/generate", func(c tele.Context) error {
+		prompt := c.Message().Payload
+		if prompt == "" {
+			return c.Send("Please provide a prompt for image generation. Example: /generate a futuristic cityscape with flying cars")
+		}
+
+		c.Notify(tele.Typing)
+		log.Printf("Processing image generation request with prompt: %s", prompt)
+
+		// Create request body for image generation
+		reqBody := ImageGenerationRequest{
+			Contents: []Content{
+				{
+					Parts: []Part{
+						{Text: prompt},
+					},
+				},
+			},
+			GenerationConfig: GenerationConfig{
+				ResponseModalities: []string{"Text", "Image"},
+			},
+			SafetySettings: []Safety{
+				{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_HATE_SPEECH", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Threshold: "BLOCK_NONE"},
+			},
+		}
+
+		jsonData, err := json.Marshal(reqBody)
+		if err != nil {
+			log.Println("Error marshaling request body:", err)
+			return c.Send("Error processing your request")
+		}
+
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key=%s", geminiApiKey)
+		log.Printf("Sending request to URL: %s", url)
+
+		client := &http.Client{Timeout: 60 * time.Second} // Longer timeout for image generation
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Println("Error creating request:", err)
+			return c.Send("Error creating request")
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Println("Error making request to Gemini API:", err)
+			return c.Send("Error connecting to AI service")
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("Error Response Body: %s\n", body)
+			return c.Send(fmt.Sprintf("Error: API returned status code %d", resp.StatusCode))
+		}
+
+		// Read full response body
+		responseBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("Error reading response body: %v", err)
+			return c.Send("Error reading API response")
+		}
+
+		// Extract base64 image data directly with regex
+		log.Printf("Extracting image data from response")
+
+		// Use regex to find the base64 encoded image data
+		re := regexp.MustCompile(`"data"\s*:\s*"([^"]+)"`)
+		matches := re.FindStringSubmatch(string(responseBody))
+
+		if len(matches) < 2 {
+			log.Printf("No image data found in the response")
+			return c.Send("Sorry, couldn't generate an image. Please try with a different prompt.")
+		}
+
+		base64Data := matches[1]
+		log.Printf("Found base64 image data of length: %d", len(base64Data))
+
+		// Create FileData structure to save in database
+		imageData := &FileData{
+			MimeType: "image/png",
+			Data:     base64Data,
+		}
+
+		// Extract any text from the response (if present)
+		reText := regexp.MustCompile(`"text"\s*:\s*"([^"]*)"`)
+		textMatches := reText.FindStringSubmatch(string(responseBody))
+
+		var responseText string
+		if len(textMatches) >= 2 && textMatches[1] != "" {
+			responseText = textMatches[1]
+			log.Printf("Found text to use as caption: %s", textMatches[1])
+		} else {
+			responseText = "Generated image based on your prompt."
+		}
+
+		// Save the message and image to the database
+		telegramID := c.Sender().ID
+		if err := saveMessage(telegramID, prompt, responseText, c.Sender(), imageData, false); err != nil {
+			log.Printf("Error saving generated image to database: %v\n", err)
+			// Continue even if saving fails
+		} else {
+			log.Printf("Successfully saved generated image to user history")
+		}
+
+		// Decode the base64 data for sending via Telegram
+		decodedImageData, err := base64.StdEncoding.DecodeString(base64Data)
+		if err != nil {
+			log.Printf("Error decoding base64 image data: %v", err)
+			return c.Send("Error processing the generated image")
+		}
+
+		log.Printf("Successfully decoded image data, size: %d bytes", len(decodedImageData))
+
+		// Save the image to a temporary file
+		tempFile, err := os.CreateTemp("", "gemini-image-*.png")
+		if err != nil {
+			log.Printf("Error creating temp file: %v", err)
+			return c.Send("Error saving the generated image")
+		}
+
+		tempFileName := tempFile.Name()
+		defer os.Remove(tempFileName) // Clean up the file when done
+
+		// Write the image data to the file
+		if _, err := tempFile.Write(decodedImageData); err != nil {
+			log.Printf("Error writing to temp file: %v", err)
+			tempFile.Close()
+			return c.Send("Error saving the generated image")
+		}
+		tempFile.Close()
+
+		log.Printf("Image saved to temporary file: %s", tempFileName)
+
+		// Send the image file to the user
+		photo := &tele.Photo{File: tele.FromDisk(tempFileName)}
+
+		// Add caption if there's text
+		if responseText != "" {
+			photo.Caption = responseText
+		}
+
+		err = c.Send(photo)
+		if err != nil {
+			log.Printf("Error sending photo: %v", err)
+			return c.Send("Generated an image but couldn't send it. Please try again.")
+		}
+
+		log.Printf("Successfully sent image to user")
+		return nil
 	})
 
 	log.Println("Bot is running...")
