@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 
@@ -53,7 +52,6 @@ type GenerationConfig struct {
 type ImageGenerationRequest struct {
 	Contents         []Content        `json:"contents"`
 	GenerationConfig GenerationConfig `json:"generationConfig"`
-	SafetySettings   []Safety         `json:"safety_settings,omitempty"`
 }
 
 type WebSource struct {
@@ -67,6 +65,10 @@ type GroundingChunk struct {
 
 type GroundingMetadata struct {
 	GroundingChunks []GroundingChunk `json:"groundingChunks"`
+}
+
+type Tool struct {
+	GoogleSearch struct{} `json:"google_search"`
 }
 
 type GeminiResponse struct {
@@ -97,8 +99,13 @@ type UserMessages struct {
 	Messages   []Message `json:"messages"`
 }
 
-type Tool struct {
-	GoogleSearch struct{} `json:"googleSearch"`
+type DynamicRetrievalConfig struct {
+	Mode             string  `json:"mode"`
+	DynamicThreshold float64 `json:"dynamic_threshold"`
+}
+
+type GoogleSearch struct {
+	DynamicRetrievalConfig DynamicRetrievalConfig `json:"dynamic_retrieval_config"`
 }
 
 func splitMessageIntoChunks(message string, maxSize int) []string {
@@ -430,7 +437,9 @@ func main() {
 				{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Threshold: "BLOCK_NONE"},
 			},
 			Tools: []Tool{
-				{GoogleSearch: struct{}{}},
+				{
+					GoogleSearch: struct{}{},
+				},
 			},
 		}
 
@@ -440,7 +449,8 @@ func main() {
 			return sendChunkedMessage(c, "Error processing your request")
 		}
 
-		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=%s", geminiApiKey)
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", geminiApiKey)
+		log.Printf("Sending request to URL: %s", url)
 
 		client := &http.Client{}
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
@@ -599,7 +609,7 @@ func main() {
 			return sendChunkedMessage(c, "Error processing your request")
 		}
 
-		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=%s", geminiApiKey)
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", geminiApiKey)
 
 		client := &http.Client{}
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
@@ -668,6 +678,7 @@ func main() {
 		c.Notify(tele.Typing)
 		log.Printf("Processing image generation request with prompt: %s", prompt)
 
+		// Create request body for image generation
 		reqBody := ImageGenerationRequest{
 			Contents: []Content{
 				{
@@ -677,13 +688,7 @@ func main() {
 				},
 			},
 			GenerationConfig: GenerationConfig{
-				ResponseModalities: []string{"Text", "Image"},
-			},
-			SafetySettings: []Safety{
-				{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_NONE"},
-				{Category: "HARM_CATEGORY_HATE_SPEECH", Threshold: "BLOCK_NONE"},
-				{Category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", Threshold: "BLOCK_NONE"},
-				{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Threshold: "BLOCK_NONE"},
+				ResponseModalities: []string{"TEXT", "IMAGE"},
 			},
 		}
 
@@ -693,10 +698,10 @@ func main() {
 			return c.Send("Error processing your request")
 		}
 
-		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key=%s", geminiApiKey)
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", geminiApiKey)
 		log.Printf("Sending request to URL: %s", url)
 
-		client := &http.Client{Timeout: 60 * time.Second}
+		client := &http.Client{Timeout: 60 * time.Second} // Longer timeout for image generation
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 		if err != nil {
 			log.Println("Error creating request:", err)
@@ -718,48 +723,59 @@ func main() {
 			return c.Send(fmt.Sprintf("Error: API returned status code %d", resp.StatusCode))
 		}
 
+		// Read full response body
 		responseBody, err := io.ReadAll(resp.Body)
 		if err != nil {
 			log.Printf("Error reading response body: %v", err)
 			return c.Send("Error reading API response")
 		}
 
-		log.Printf("Extracting image data from response")
-
-		re := regexp.MustCompile(`"data"\s*:\s*"([^"]+)"`)
-		matches := re.FindStringSubmatch(string(responseBody))
-
-		if len(matches) < 2 {
-			log.Printf("No image data found in the response")
-			return c.Send("Sorry, couldn't generate an image. Please try with a different prompt.")
+		// Parse the response to extract image data
+		var response struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						InlineData struct {
+							Data string `json:"data"`
+						} `json:"inlineData"`
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
 		}
 
-		base64Data := matches[1]
-		log.Printf("Found base64 image data of length: %d", len(base64Data))
+		if err := json.Unmarshal(responseBody, &response); err != nil {
+			log.Printf("Error parsing response JSON: %v", err)
+			return c.Send("Error processing the generated image")
+		}
 
+		if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
+			return c.Send("No image was generated. Please try again with a different prompt.")
+		}
+
+		// Find the image data in the response
+		var base64Data string
+		var caption string
+		for _, part := range response.Candidates[0].Content.Parts {
+			if part.InlineData.Data != "" {
+				base64Data = part.InlineData.Data
+			}
+			if part.Text != "" {
+				caption = part.Text
+			}
+		}
+
+		if base64Data == "" {
+			return c.Send("No image data received. Please try again.")
+		}
+
+		// Create FileData structure to save in database
 		imageData := &FileData{
 			MimeType: "image/png",
 			Data:     base64Data,
 		}
 
-		reText := regexp.MustCompile(`"text"\s*:\s*"([^"]*)"`)
-		textMatches := reText.FindStringSubmatch(string(responseBody))
-
-		var responseText string
-		if len(textMatches) >= 2 && textMatches[1] != "" {
-			responseText = textMatches[1]
-			log.Printf("Found text to use as caption: %s", textMatches[1])
-		} else {
-			responseText = "Generated image based on your prompt."
-		}
-
-		telegramID := c.Sender().ID
-		if err := saveMessage(telegramID, prompt, responseText, c.Sender(), imageData, false); err != nil {
-			log.Printf("Error saving generated image to database: %v\n", err)
-		} else {
-			log.Printf("Successfully saved generated image to user history")
-		}
-
+		// Decode the base64 data for sending via Telegram
 		decodedImageData, err := base64.StdEncoding.DecodeString(base64Data)
 		if err != nil {
 			log.Printf("Error decoding base64 image data: %v", err)
@@ -768,6 +784,7 @@ func main() {
 
 		log.Printf("Successfully decoded image data, size: %d bytes", len(decodedImageData))
 
+		// Save the image to a temporary file
 		tempFile, err := os.CreateTemp("", "gemini-image-*.png")
 		if err != nil {
 			log.Printf("Error creating temp file: %v", err)
@@ -775,8 +792,9 @@ func main() {
 		}
 
 		tempFileName := tempFile.Name()
-		defer os.Remove(tempFileName)
+		defer os.Remove(tempFileName) // Clean up the file when done
 
+		// Write the image data to the file
 		if _, err := tempFile.Write(decodedImageData); err != nil {
 			log.Printf("Error writing to temp file: %v", err)
 			tempFile.Close()
@@ -786,10 +804,21 @@ func main() {
 
 		log.Printf("Image saved to temporary file: %s", tempFileName)
 
+		// Send the image file to the user
 		photo := &tele.Photo{File: tele.FromDisk(tempFileName)}
 
-		if responseText != "" {
-			photo.Caption = responseText
+		// Add caption if there's text
+		if caption != "" {
+			photo.Caption = caption
+		}
+
+		// Save the message and image to the database
+		telegramID := c.Sender().ID
+		if err := saveMessage(telegramID, prompt, caption, c.Sender(), imageData, false); err != nil {
+			log.Printf("Error saving generated image to database: %v\n", err)
+			// Continue even if saving fails
+		} else {
+			log.Printf("Successfully saved generated image to user history")
 		}
 
 		err = c.Send(photo)
