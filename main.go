@@ -449,7 +449,7 @@ func main() {
 			return sendChunkedMessage(c, "Error processing your request")
 		}
 
-		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", geminiApiKey)
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=%s", geminiApiKey)
 		log.Printf("Sending request to URL: %s", url)
 
 		client := &http.Client{}
@@ -609,7 +609,7 @@ func main() {
 			return sendChunkedMessage(c, "Error processing your request")
 		}
 
-		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", geminiApiKey)
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=%s", geminiApiKey)
 
 		client := &http.Client{}
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
@@ -701,7 +701,7 @@ func main() {
 		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", geminiApiKey)
 		log.Printf("Sending request to URL: %s", url)
 
-		client := &http.Client{Timeout: 60 * time.Second} // Longer timeout for image generation
+		client := &http.Client{Timeout: 60 * time.Second}
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 		if err != nil {
 			log.Println("Error creating request:", err)
